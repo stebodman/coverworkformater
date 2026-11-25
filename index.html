@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maths Cover Work Builder</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root { --bg:#f4f6fa; --card:#fff; --ink:#1b2430; --mute:#5b6675; --line:#d5dbe5; --accent:#1f4fd8; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14181f; --card:#1d232d; --ink:#e8edf5; --mute:#9aa6b8; --line:#333c4a; --accent:#6f95ff; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Arial,sans-serif; background:var(--bg); color:var(--ink); }
+  .wrap { max-width:1100px; margin:0 auto; padding:16px; display:grid; grid-template-columns:340px 1fr; gap:16px; align-items:start; }
+  @media (max-width:800px){ .wrap{ grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  h1 { font-size:20px; margin:0 0 14px; }
+  label { display:block; font-size:13px; font-weight:600; margin:10px 0 4px; }
+  input[type=text], input[type=date], input[type=number] { width:100%; padding:8px 10px; font-size:15px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--ink); }
+  .drop { border:2px dashed var(--line); border-radius:8px; padding:16px; text-align:center; cursor:pointer; color:var(--mute); font-size:14px; }
+  .drop.over { border-color:var(--accent); color:var(--accent); }
+  .hint { font-size:12px; color:var(--mute); margin-top:4px; }
+  .btns { display:flex; gap:8px; margin-top:16px; }
+  button, a.btn { flex:1; padding:10px; font-size:15px; font-weight:600; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; text-align:center; text-decoration:none; }
+  a.btn.sec { background:transparent; color:var(--accent); }
+  button:disabled, a.btn.disabled { opacity:.4; pointer-events:none; }
+  #status { font-size:13px; margin-top:12px; color:var(--mute); min-height:18px; }
+  #status.err { color:#d33; }
+  #preview { padding:8px; }
+  iframe { display:block; width:100%; height:calc(100vh - 66px); min-height:300px; border:1px solid var(--line); border-radius:8px; background:#888; }
+  .empty { height:calc(100vh - 66px); display:flex; align-items:center; justify-content:center; color:var(--mute); }
+  #printArea { display:none; }
+  @media print {
+    @page { size: A4 portrait; margin: 0; }
+    body > *:not(#printArea) { display:none !important; }
+    body { background:#fff; }
+    #printArea { display:block; }
+    #printArea .sheet { width:210mm; height:296mm; overflow:hidden; page-break-after:always; break-after:page; }
+    #printArea .sheet:last-child { page-break-after:auto; break-after:auto; }
+    #printArea img { display:block; width:210mm; height:296mm; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Maths Cover Work Builder</h1>
+    <div class="drop" id="drop">Drop PDF here or click to choose<input type="file" id="file" accept="application/pdf" hidden></div>
+    <div class="hint" id="fname">No PDF loaded</div>
+
+    <label for="staff">Staff</label><input type="text" id="staff">
+    <label for="date">Date</label><input type="date" id="date">
+    <label for="lesson">Lesson</label><input type="text" id="lesson">
+    <label for="cls">Class</label><input type="text" id="cls">
+    <label for="size">Class size</label><input type="number" id="size" value="30" min="1" max="60">
+    <div class="hint">Blank fields print a line to complete by hand.</div>
+
+    <div class="btns">
+      <button id="print" disabled>Print / Save as PDF</button>
+      <a class="btn sec disabled" id="save" download="Maths Cover Work.pdf">Download PDF</a>
+    </div>
+    <div id="status"></div>
+  </div>
+  <div class="card" id="preview"><div class="empty">Load a PDF to see the print-out</div></div>
+</div>
+
+<div id="printArea"></div>
+<script>
+const { PDFDocument, StandardFonts, rgb, degrees } = PDFLib;
+const A4W = 595.28, A4H = 841.89;
+let srcBytes = null, blobUrl = null, lastBuild = null, timer = null, token = 0;
+const $ = id => document.getElementById(id);
+
+// ---------- file loading ----------
+const drop = $('drop'), fileIn = $('file');
+drop.onclick = () => fileIn.click();
+fileIn.onchange = () => fileIn.files[0] && load(fileIn.files[0]);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && load(e.dataTransfer.files[0]); };
+async function load(f) {
+  srcBytes = new Uint8Array(await f.arrayBuffer());
+  $('fname').textContent = f.name;
+  rebuild();
+}
+['staff','date','lesson','cls','size'].forEach(id => $(id).addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(rebuild, 400); }));
+
+// ---------- helpers ----------
+const clean = s => String(s).replace(/[^\x20-\x7E\xA0-\xFF]/g, '?');
+function fmtDate(v) { if (!v) return ''; const [y,m,d] = v.split('-'); return `${d}/${m}/${y}`; }
+
+// Fit an embedded page into a box, rotating 90 degrees when orientations differ.
+function place(page, emb, bx, by, bw, bh, margin, border) {
+  const rot = (emb.height > emb.width) !== (bh > bw);
+  if (border) page.drawRectangle({ x: bx+2, y: by+2, width: bw-4, height: bh-4, borderColor: rgb(.7,.7,.7), borderWidth: .5 });
+  if (!rot) {
+    const s = Math.min((bw-2*margin)/emb.width, (bh-2*margin)/emb.height);
+    page.drawPage(emb, { x: bx+(bw-emb.width*s)/2, y: by+(bh-emb.height*s)/2, xScale: s, yScale: s });
+  } else {
+    const s = Math.min((bw-2*margin)/emb.height, (bh-2*margin)/emb.width);
+    page.drawPage(emb, { x: bx+(bw+emb.height*s)/2, y: by+(bh-emb.width*s)/2, xScale: s, yScale: s, rotate: degrees(90) });
+  }
+}
+
+function drawCover(page, font, bold, f) {
+  const top = A4H, mid = A4H/2, L = 50, R = A4W-50;
+  page.drawRectangle({ x: 25, y: mid+20, width: A4W-50, height: top-mid-45, borderColor: rgb(0,0,0), borderWidth: 2 });
+  const title = 'Maths Cover Work', ts = 44;
+  page.drawText(title, { x: (A4W - bold.widthOfTextAtSize(title, ts))/2, y: top-90, size: ts, font: bold });
+  const rows = [['Staff:', f.staff], ['Date:', f.date], ['Lesson:', f.lesson], ['Class:', f.cls], ['Class size:', f.size]];
+  const fs = 24, valX = L + 150;
+  rows.forEach(([label, val], i) => {
+    const y = top - 165 - i*55;
+    page.drawText(label, { x: L, y, size: fs, font: bold });
+    if (val) page.drawText(clean(val), { x: valX + 6, y, size: fs, font });
+    page.drawLine({ start: { x: valX, y: y-5 }, end: { x: R, y: y-5 }, thickness: 1, color: rgb(0,0,0) });
+  });
+}
+
+async function build() {
+  const src = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
+  const n = src.getPageCount();
+  if (n < 3) throw new Error('PDF needs at least 3 pages (found ' + n + ').');
+  const size = Math.max(1, Math.min(60, parseInt($('size').value, 10) || 30));
+  const f = { staff: $('staff').value.trim(), date: fmtDate($('date').value), lesson: $('lesson').value.trim(), cls: $('cls').value.trim(), size: String(size) };
+
+  const out = await PDFDocument.create();
+  const font = await out.embedFont(StandardFonts.Helvetica);
+  const bold = await out.embedFont(StandardFonts.HelveticaBold);
+
+  const infoIdx = [0,1,2,3].filter(i => i < n);       // original pages 1-4 (page 5+ ignored)
+  const info = await out.embedPdf(src, infoIdx);
+  const pupil = await out.embedPdf(src, [1,2]);        // original pages 2 and 3
+
+  drawCover(out.addPage([A4W, A4H]), font, bold, f);   // page 1: cover
+  out.addPage([A4W, A4H]);                             // page 2: blank reverse
+
+  for (let i = 0; i < info.length; i += 2) {           // teacher info, 2 per side
+    const p = out.addPage([A4W, A4H]);
+    place(p, info[i], 0, A4H/2, A4W, A4H/2, 14, true);
+    if (info[i+1]) place(p, info[i+1], 0, 0, A4W, A4H/2, 14, true);
+  }
+  for (let c = 0; c < size; c++) {                     // pupil copies
+    for (const emb of pupil) place(out.addPage([A4W, A4H]), emb, 0, 0, A4W, A4H, 10, false);
+  }
+  return { bytes: await out.save({ useObjectStreams: false }), pages: out.getPageCount(), size, infoPages: Math.ceil(info.length/2) };
+}
+
+async function rebuild() {
+  if (!srcBytes) return;
+  const my = ++token;
+  $('status').className = ''; $('status').textContent = 'Building…';
+  $('print').disabled = true; $('save').classList.add('disabled');
+  try {
+    const r = await build();
+    if (my !== token) return;
+    lastBuild = r;
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    blobUrl = URL.createObjectURL(new Blob([r.bytes], { type: 'application/pdf' }));
+    $('preview').innerHTML = '<iframe id="frame" title="Preview"></iframe>';
+    $('frame').src = blobUrl;
+    $('save').href = blobUrl;
+    const cls = $('cls').value.trim().replace(/[\\/:*?"<>|]/g, '');
+    $('save').download = 'Maths Cover Work' + (cls ? ' - ' + cls : '') + '.pdf';
+    $('save').classList.remove('disabled');
+    $('print').disabled = false;
+    $('status').textContent = `${r.pages} pages (${r.pages/2} sheets double-sided) for ${r.size} pupils. Print double-sided, flip on long edge.`;
+  } catch (e) {
+    if (my !== token) return;
+    $('status').className = 'err'; $('status').textContent = 'Error: ' + e.message;
+  }
+}
+
+// ---------- direct print ----------
+// Render the distinct pages to images, lay them out in a hidden print area and call window.print().
+let pdfjsReady = false;
+async function initPdfjs() {
+  if (pdfjsReady) return;
+  const base = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+  const txt = await (await fetch(base + 'pdf.worker.min.js')).text();
+  pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([txt], { type: 'text/javascript' }));
+  pdfjsReady = true;
+}
+async function renderDistinct(r) {
+  await initPdfjs();
+  const doc = await pdfjsLib.getDocument({ data: r.bytes.slice() }).promise;
+  const count = 2 + r.infoPages + 2;                     // cover, blank, info sheets, 2 pupil pages
+  const imgs = [];
+  for (let n = 1; n <= count; n++) {
+    if (n === 2) { imgs.push(null); continue; }          // blank reverse
+    const page = await doc.getPage(n);
+    const vp = page.getViewport({ scale: 200 / 72 });    // 200 dpi
+    const c = document.createElement('canvas');
+    c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    imgs.push(c.toDataURL('image/jpeg', 0.92));
+  }
+  return imgs;
+}
+function sheet(src) {
+  const d = document.createElement('div'); d.className = 'sheet';
+  if (src) { const im = document.createElement('img'); im.src = src; d.appendChild(im); }
+  return d;
+}
+$('print').onclick = async () => {
+  const btn = $('print');
+  btn.disabled = true; $('status').className = ''; $('status').textContent = 'Preparing print…';
+  try {
+    const r = lastBuild;
+    const imgs = await renderDistinct(r);
+    const area = $('printArea'); area.innerHTML = '';
+    const frontCount = 2 + r.infoPages;
+    for (let i = 0; i < frontCount; i++) area.appendChild(sheet(imgs[i]));
+    for (let c = 0; c < r.size; c++) { area.appendChild(sheet(imgs[frontCount])); area.appendChild(sheet(imgs[frontCount + 1])); }
+    await Promise.all([...area.querySelectorAll('img')].map(im => im.decode ? im.decode().catch(() => {}) : 0));
+    $('status').textContent = `${r.pages} pages ready. Print double-sided, flip on long edge.`;
+    window.print();
+  } catch (e) {
+    $('status').className = 'err';
+    $('status').textContent = 'Direct print failed (' + e.message + '). Use Download PDF instead.';
+  } finally { btn.disabled = false; }
+};
+</script>
+</body>
+</html>
